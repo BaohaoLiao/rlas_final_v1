@@ -915,7 +915,7 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
-    def _generate_multi_round_with_early_downsampling(
+    def _generate_multi_round_adaptive_downsampling(
         self,
         orig_prompt_batch: DataProto,
         positive_threshold: float = 0.7,
@@ -1249,7 +1249,7 @@ class RayPPOTrainer:
                     # generate a batch
                     if self.config.algorithm.multiround_downsampling:
                         with marked_timer("gen_multi_round", timing_raw, color="red"):
-                            final_batch, rounds_info = self._generate_multi_round_with_early_downsampling(
+                            final_batch, rounds_info = self._generate_multi_round_adaptive_downsampling(
                                 orig_prompt_batch=gen_batch,
                                 positive_threshold=self.config.algorithm.positive_threshold,
                                 max_rounds=self.config.algorithm.max_rounds,

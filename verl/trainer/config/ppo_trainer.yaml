@@ -85,7 +85,7 @@ algorithm:
   norm_adv_by_std_in_grpo: True
 
   # Reinforce_Ada specific
-  multiround_downsampling: False
+  multiround_adaptive_downsampling: False
   positive_threshold: 0.7
   max_rounds: 4
   round_repeat: 8
