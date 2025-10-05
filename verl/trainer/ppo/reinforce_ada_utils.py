@@ -8,7 +8,6 @@ import torch
 import ray
 from verl import DataProto
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.ray_trainer import apply_kl_penalty
 
 
 def get_first_dim_size(dp: DataProto) -> int:
@@ -235,6 +234,8 @@ def compute_seq_rewards_for_round(
             - seq_reward: Tensor of sequence-level rewards
             - uids_round: List of uids in this round
     """
+    from verl.trainer.ppo.ray_trainer import apply_kl_penalty
+    
     Bp = get_first_dim_size(mini_prompt_batch)
     Bg = get_first_dim_size(gen_out)
     if Bg % Bp != 0:
