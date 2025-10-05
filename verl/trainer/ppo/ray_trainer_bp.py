@@ -18,11 +18,10 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import random
 import json
 import os
+import random
 import uuid
-import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -61,19 +60,6 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-
-# Utility functions for Reinforce-Ada
-from verl.trainer.ppo.reinforce_ada_utils import (
-    get_first_dim_size,
-    concat_dataproto_fragments,
-    build_uid_to_fields_mapping,
-    ensure_uid_in_batch,
-    align_context_to_selected,
-    merge_context_fields_into_batch,
-    validate_tensordict_performance,
-    compute_seq_rewards_for_round,
-)
-
 
 @dataclass
 class ResourcePoolManager:
@@ -294,6 +280,18 @@ class RayPPOTrainer:
     This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
     managing actor rollouts, critic training, and reward computation with Ray backend.
     Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
+    
+    Downsampling Configuration:
+    The trainer supports intelligent downsampling from N samples per prompt to a fixed number.
+    Configure via trainer config:
+    - positive_threshold: float = 0.9  # Threshold for positive samples (reward > threshold)
+    - max_total_samples_per_prompt: int = 8  # Final number of samples per prompt
+    - max_positive_samples_per_prompt: int = 4  # Max positive samples in final set
+    
+    Downsampling Strategy:
+    1. Prioritize up to max_positive_samples_per_prompt positive samples
+    2. Fill remaining slots with negative samples  
+    3. If insufficient negative samples, use remaining positive samples as fallback
     """
 
     # TODO: support each role have individual ray_worker_group_cls,
@@ -919,83 +917,262 @@ class RayPPOTrainer:
         self,
         orig_prompt_batch: DataProto,
         positive_threshold: float = 0.7,
-        max_rounds: int = 8,
+        actual_repeat: int = 32,
         round_repeat: int = 4,
         final_keep_per_prompt: int = 4,
         timing_raw: dict | None = None,
         context_batch: DataProto | None = None,
     ):
         """
-        Iterative multi-round generation with early stopping downsampling.
-
-        Args:
-            orig_prompt_batch: Original prompt batch to generate from
-            positive_threshold: Threshold for classifying samples as positive (reward > threshold)
-            max_rounds: Maximum number of rounds to perform
-            round_repeat: Number of samples to generate per active prompt in each round
-            final_keep_per_prompt: Final number of samples to keep per prompt (target: half positive, half negative)
-            timing_raw: Optional dict to record timing information
-            context_batch: Optional context batch for field alignment via uid
-
-        Returns:
-            Tuple of (final_batch, rounds_info) where:
-                - final_batch: DataProto with selected samples and aligned context fields
-                - rounds_info: Dict with per-round statistics
+        迭代式多轮生成 + 早停下采样（片段缓存，按 uid 对齐补字段；不依赖 DataProto '+'）
         """
-        target_pos = final_keep_per_prompt // 2
-        target_neg = final_keep_per_prompt - target_pos
+        import time
+        import numpy as np
+        import torch
+        from collections import defaultdict
 
-        # Build uid -> fields mapping from context
-        ctx_uid_to_fields = {}
+        assert actual_repeat % round_repeat == 0, "actual_repeat 必须能被 round_repeat 整除"
+        max_rounds = actual_repeat // round_repeat
+
+        # -------------------- 工具函数 --------------------
+        def _first_dim_size(dp: DataProto) -> int:
+            if hasattr(dp, "batch") and isinstance(dp.batch, dict) and dp.batch:
+                for v in dp.batch.values():
+                    if isinstance(v, torch.Tensor):
+                        return v.shape[0]
+            if hasattr(dp, "non_tensor_batch") and isinstance(dp.non_tensor_batch, dict) and dp.non_tensor_batch:
+                for v in dp.non_tensor_batch.values():
+                    try:
+                        return len(v)
+                    except Exception:
+                        continue
+            raise RuntimeError("Cannot infer batch size from DataProto")
+
+        def _dp_rows(dp: DataProto) -> int:
+            return _first_dim_size(dp)
+
+        def _dp_cat(frags: list[DataProto]) -> DataProto:
+            """按行拼接若干 DataProto 片段，返回新的 DataProto。"""
+            assert len(frags) > 0, "空片段列表"
+            # 1) 统一 keys
+            tensor_keys_sets = [set(f.batch.keys()) for f in frags]
+            nontensor_keys_sets = [set(f.non_tensor_batch.keys()) for f in frags]
+            tensor_keys = set.intersection(*tensor_keys_sets) if tensor_keys_sets else set()
+            nontensor_keys = set.intersection(*nontensor_keys_sets) if nontensor_keys_sets else set()
+
+            # 如果有不相交的键，优先取交集；需要的话也可改成并集+填充默认值
+            if any(set(f.batch.keys()) != tensor_keys for f in frags):
+                missing = set.union(*tensor_keys_sets) - tensor_keys
+                print(f"[warn] tensor keys 不一致，使用交集：忽略 {missing}")
+            if any(set(f.non_tensor_batch.keys()) != nontensor_keys for f in frags):
+                missing = set.union(*nontensor_keys_sets) - nontensor_keys
+                print(f"[warn] non-tensor keys 不一致，使用交集：忽略 {missing}")
+
+            # 2) 拼接
+            out_batch = {}
+            for k in tensor_keys:
+                parts = [f.batch[k] for f in frags]
+                # 设备/dtype 以第一个为准
+                out_batch[k] = torch.cat(parts, dim=0)
+
+            out_non_tensor = {}
+            for k in nontensor_keys:
+                parts = []
+                for f in frags:
+                    v = f.non_tensor_batch[k]
+                    arr = v if isinstance(v, np.ndarray) else np.array(v, dtype=object)
+                    if arr.dtype != object:
+                        arr = arr.astype(object)
+                    parts.append(arr)
+                out_non_tensor[k] = np.concatenate(parts, axis=0)
+
+            # 3) 构建新的 DataProto
+            merged: DataProto = DataProto.from_single_dict({**out_batch, **out_non_tensor})
+            # 4) meta_info（沿用首个片段）
+            try:
+                merged.meta_info = dict(getattr(frags[0], "meta_info", {}) or {})
+            except Exception:
+                pass
+            return merged
+
+        # -------------------- context_batch: uid -> fields 映射（全量 non-tensor 键） --------------------
+        ctx_uid_to_fields: dict = {}
         if context_batch is not None:
-            ctx_uid_to_fields = build_uid_to_fields_mapping(context_batch)
+            if "uid" not in context_batch.non_tensor_batch:
+                raise KeyError("context_batch 缺少 uid；无法基于 uid 做字段补齐。")
+            ctx_uids = list(context_batch.non_tensor_batch["uid"])
+            ctx_keys = list(context_batch.non_tensor_batch.keys())
+            for i, u in enumerate(ctx_uids):
+                d = ctx_uid_to_fields.setdefault(u, {})
+                for key in ctx_keys:
+                    d[key] = context_batch.non_tensor_batch[key][i]
 
-        # Ensure orig_prompt_batch has uid
-        ensure_uid_in_batch(orig_prompt_batch, context_batch)
+        # ✅ orig_prompt_batch 必须有 uid（只从 context 复制，不生成随机 uid）
+        if "uid" not in orig_prompt_batch.non_tensor_batch:
+            if context_batch is not None and "uid" in context_batch.non_tensor_batch and \
+            _first_dim_size(context_batch) == _first_dim_size(orig_prompt_batch):
+                orig_prompt_batch.non_tensor_batch["uid"] = np.array(
+                    list(context_batch.non_tensor_batch["uid"]), dtype=object
+                )
+            else:
+                raise KeyError("orig_prompt_batch 缺少 uid，且无法从 context_batch 对齐复制；请确保 _get_gen_batch 透传 uid。")
+
         uid_arr = list(orig_prompt_batch.non_tensor_batch["uid"])
 
-        # Initialize state tracking for each uid
-        state = {uid: {"finished": False, "seen": 0, "pos": 0, "neg": 0} for uid in uid_arr}
+        # 状态
+        state = {
+            uid: {"finished": False, "seen": 0, "pos": 0, "first4_gidx": [], "later_pos_gidx": []}
+            for uid in uid_arr
+        }
 
-        # Caches for positive and negative samples per uid
-        pos_cache = defaultdict(list)
-        neg_cache = defaultdict(list)
+        # 片段缓存 & 结果累积
+        first4_cache: dict[str, DataProto] = {}   # uid -> 第0轮的前4条片段
+        pos_cache = defaultdict(list)             # uid -> [单行正样本片段, ...]
         selected_pool_batches: list[DataProto] = []
         selected_count_by_uid = defaultdict(int)
         rounds_info = {"per_round": []}
 
-        # Main generation loop
+        # -------------------- 轮内：对齐并计算奖励 --------------------
+        def compute_seq_rewards_for_round(mini_prompt_batch: DataProto, gen_out: DataProto):
+            def _repeat_tensor(t: torch.Tensor, rep: int) -> torch.Tensor:
+                return t.repeat_interleave(rep, dim=0)
+
+            Bp = _first_dim_size(mini_prompt_batch)
+            Bg = _first_dim_size(gen_out)
+            if Bg % Bp != 0:
+                raise ValueError(f"Batch mismatch: gen_out({Bg}) is not a multiple of mini_prompt_batch({Bp}).")
+            rep = Bg // Bp
+
+            if not hasattr(gen_out, "non_tensor_batch") or gen_out.non_tensor_batch is None:
+                gen_out.non_tensor_batch = {}
+
+            # 1) uid
+            if "uid" not in gen_out.non_tensor_batch:
+                if "uid" in mini_prompt_batch.non_tensor_batch:
+                    gen_out.non_tensor_batch["uid"] = np.repeat(
+                        np.array(mini_prompt_batch.non_tensor_batch["uid"], dtype=object), rep, axis=0
+                    )
+                else:
+                    raise KeyError("无法在 gen_out 对齐 uid；mini_prompt_batch.non_tensor_batch 里也没有 uid。")
+
+            # 2) 复制 mini_prompt_batch 的所有 non-tensor 键（按 rep 展开）
+            for k, v in mini_prompt_batch.non_tensor_batch.items():
+                if k in gen_out.non_tensor_batch:
+                    continue
+                arr = np.array(v, dtype=object)
+                if arr.shape[0] != Bp:
+                    raise ValueError(f"mini_prompt_batch.non_tensor_batch['{k}'] 长度 {arr.shape[0]} != {Bp}")
+                gen_out.non_tensor_batch[k] = np.repeat(arr, rep, axis=0)
+
+            # 3) context(uid-join) 补齐关键字段 + 其它可补字段
+            uids_round = list(gen_out.non_tensor_batch["uid"])
+            required_keys = ["reward_model"]
+            rfk = getattr(self.reward_fn, "reward_fn_key", None)
+            if isinstance(rfk, str) and len(rfk) > 0:
+                required_keys.append(rfk)
+            else:
+                required_keys.append("data_source")
+            for key in required_keys:
+                if key in gen_out.non_tensor_batch:
+                    continue
+                filled, miss = [], 0
+                for u in uids_round:
+                    src = ctx_uid_to_fields.get(u, None)
+                    if src is None or key not in src:
+                        miss += 1; filled.append(None)
+                    else:
+                        filled.append(src[key])
+                if miss == len(uids_round):
+                    raise KeyError(f"关键字段 '{key}' 在 mini_prompt_batch 和 context_batch 中都拿不到。")
+                if any(x is None for x in filled):
+                    ids = [i for i, x in enumerate(filled) if x is None][:5]
+                    raise KeyError(f"'{key}' 通过 uid 映射仍有缺失（样例索引: {ids}）。请确保 context_batch 覆盖所有活跃 uid。")
+                gen_out.non_tensor_batch[key] = np.array(filled, dtype=object)
+
+            if ctx_uid_to_fields:
+                sample_any = next(iter(ctx_uid_to_fields.values()), {})
+                ctx_all_keys = set(sample_any.keys()) if isinstance(sample_any, dict) else set()
+                aux_keys = [k for k in ctx_all_keys if k not in gen_out.non_tensor_batch]
+                for key in aux_keys:
+                    try:
+                        filled = [ctx_uid_to_fields.get(u, {}).get(key, None) for u in uids_round]
+                        if all(v is None for v in filled):
+                            continue
+                        gen_out.non_tensor_batch[key] = np.array(filled, dtype=object)
+                    except Exception:
+                        pass
+
+            # 4) 如需补张量键（attention_mask 等），可在此从 mini_prompt_batch 按 rep 补齐
+            # for k in required_prompt_tensor_keys:
+            #     if k not in gen_out.batch and k in mini_prompt_batch.batch:
+            #         gen_out.batch[k] = _repeat_tensor(mini_prompt_batch.batch[k], rep)
+
+            # 5) meta（可选）
+            if hasattr(mini_prompt_batch, "meta_info") and isinstance(mini_prompt_batch.meta_info, dict):
+                if not hasattr(gen_out, "meta_info") or gen_out.meta_info is None:
+                    gen_out.meta_info = {}
+                if "global_steps" in mini_prompt_batch.meta_info and "global_steps" not in gen_out.meta_info:
+                    gen_out.meta_info["global_steps"] = mini_prompt_batch.meta_info["global_steps"]
+
+            # ==== 奖励 / KL ====
+            mini = gen_out
+            if self.use_rm and "rm_scores" not in mini.batch.keys():
+                rm_tensor = self.rm_wg.compute_rm_score(mini)
+                mini = mini.union(rm_tensor)
+
+            if self.config.reward_model.launch_reward_fn_async:
+                future_r = compute_reward_async.remote(data=mini, reward_fn=self.reward_fn)
+                reward_tensor, reward_extra_infos_dict = ray.get(future_r)
+            else:
+                reward_tensor, reward_extra_infos_dict = compute_reward(mini, self.reward_fn)
+
+            mini.batch["token_level_scores"] = reward_tensor
+
+            if self.config.algorithm.use_kl_in_reward:
+                mini, _ = apply_kl_penalty(mini, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                seq_reward = mini.batch["token_level_rewards"].sum(dim=-1)
+            else:
+                seq_reward = reward_tensor.sum(dim=-1)
+                mini.batch["token_level_rewards"] = reward_tensor
+
+            if reward_extra_infos_dict:
+                for k, v in reward_extra_infos_dict.items():
+                    try:
+                        if len(v) == _first_dim_size(mini):
+                            mini.non_tensor_batch[k] = np.array(v, dtype=object)
+                    except Exception:
+                        pass
+
+            return mini, seq_reward, uids_round
+
+        # -------------------- 轮询 --------------------
         active_uids = set(uid_arr)
         for r in range(max_rounds):
             t0 = time.time()
             if not active_uids:
-                rounds_info["per_round"].append(
-                    {
-                        "round": r,
-                        "active_prompts": 0,
-                        "completed": 0,
-                        "finished_prompts": sum(1 for s in state.values() if s["finished"]),
-                        "sec": 0.0,
-                    }
-                )
+                rounds_info["per_round"].append({
+                    "round": r, "active_prompts": 0, "made_positive": 0,
+                    "finished_prompts": sum(1 for s in state.values() if s["finished"]),
+                    "sec": 0.0,
+                })
                 break
 
-            # Create mini-batch for active prompts only
+            # 活跃子批
             uid_to_idx = {uid: i for i, uid in enumerate(uid_arr)}
             active_indices = [uid_to_idx[uid] for uid in uid_arr if uid in active_uids]
             mini_prompt_batch = orig_prompt_batch[active_indices]
+
+            # 生成
             round_inp = mini_prompt_batch.repeat(repeat_times=round_repeat, interleave=True)
 
-            # Pad to be divisible by dp_size
-            dp_size = self.actor_rollout_wg.dp_size if hasattr(self.actor_rollout_wg, "dp_size") else 8
+            dp_size = self.actor_rollout_wg.dp_size if hasattr(self.actor_rollout_wg, 'dp_size') else 8
             batch_size = len(round_inp)
             padding_applied = False
             if batch_size % dp_size != 0:
+                # Pad the batch to make it divisible by dp_size
                 padding_needed = dp_size - (batch_size % dp_size)
-                print(
-                    f"Padding batch from {batch_size} to {batch_size + padding_needed} "
-                    f"to make it divisible by {dp_size}"
-                )
+                print(f"Padding batch from {batch_size} to {batch_size + padding_needed} to make it divisible by {dp_size}")
+                # Repeat the last few samples to pad
                 indices_to_repeat = list(range(batch_size - padding_needed, batch_size))
                 if len(indices_to_repeat) == 0:
                     indices_to_repeat = [batch_size - 1] * padding_needed
@@ -1003,169 +1180,199 @@ class RayPPOTrainer:
                 round_inp = DataProto.concat([round_inp, padding_batch])
                 padding_applied = True
 
-            # Generate sequences
-            gen_out = (
-                self.actor_rollout_wg.generate_sequences(round_inp)
-                if not self.async_rollout_mode
-                else self.async_rollout_manager.generate_sequences(round_inp)
-            )
+            gen_out = (self.actor_rollout_wg.generate_sequences(round_inp)
+                    if not self.async_rollout_mode
+                    else self.async_rollout_manager.generate_sequences(round_inp))
 
-            # Remove padding if applied
             if padding_applied:
                 gen_out = gen_out[:batch_size]
+                # Also trim the round_inp to match
                 round_inp = round_inp[:batch_size]
 
-            # Compute rewards for this round
-            mini_with_out, seq_reward, uids_round = compute_seq_rewards_for_round(
-                mini_prompt_batch=mini_prompt_batch,
-                gen_out=gen_out,
-                ctx_uid_to_fields=ctx_uid_to_fields,
-                reward_fn=self.reward_fn,
-                use_rm=self.use_rm,
-                rm_wg=self.rm_wg,
-                config=self.config,
-                kl_ctrl_in_reward=self.kl_ctrl_in_reward if self.config.algorithm.use_kl_in_reward else None,
-            )
+            # 轮内奖励
+            mini_with_out, seq_reward, uids_round = compute_seq_rewards_for_round(mini_prompt_batch, gen_out)
             seq_reward_np = seq_reward.detach().cpu().numpy().tolist()
 
-            # Group by uid
+            # 轮内 uid -> 局部行索引
             per_uid_local_idx = defaultdict(list)
             for j, uid in enumerate(uids_round):
                 per_uid_local_idx[uid].append(j)
 
-            # Update state and cache samples
-            completed_this_round = 0
+            # 按 uid 更新状态/缓存与收敛
+            made_positive_this_round = 0
             for uid in list(active_uids):
                 locs = per_uid_local_idx.get(uid, [])
                 if not locs:
                     continue
                 st = state[uid]
 
-                # Cache positive and negative samples
+                # r==0：缓存前4片段
+                if r == 0:
+                    first4 = locs[:round_repeat]
+                    st["first4_gidx"].extend(first4)
+                    if first4 and uid not in first4_cache:
+                        first4_cache[uid] = mini_with_out[first4]
+
+                # 本轮判定与缓存正样本片段
                 for j in locs:
                     if st["finished"]:
-                        break
+                        break  # 该 uid 已完成，本轮不再处理更多片段，避免重复追加
                     st["seen"] += 1
-                    is_positive = seq_reward_np[j] > positive_threshold
-                    if is_positive:
+                    if seq_reward_np[j] > positive_threshold:
                         st["pos"] += 1
-                        pos_cache[uid].append(mini_with_out[[j]])
-                    else:
-                        st["neg"] += 1
-                        neg_cache[uid].append(mini_with_out[[j]])
+                        if r == 0 and j in st["first4_gidx"]:
+                            # 第0轮前4已有正样本：直接用前4收敛（仅追加一次）
+                            if selected_count_by_uid.get(uid, 0) == 0 and not st["finished"]:
+                                selected_pool_batches.append(first4_cache[uid])
+                                selected_count_by_uid[uid] = final_keep_per_prompt
+                                st["finished"] = True
+                            made_positive_this_round += 1
+                            break  # first4 已使用，停止处理该 uid 的本轮其它片段
+                        else:
+                            # 缓存该条正样本的单行片段
+                            pos_cache[uid].append(mini_with_out[[j]])
+                            made_positive_this_round += 1
 
-                # Check if we have enough samples to finish this uid
+                # 达到比例后，用缓存片段收敛
                 if not st["finished"]:
-                    if len(pos_cache[uid]) >= target_pos and len(neg_cache[uid]) >= target_neg:
+                    ratio = (st["pos"] / st["seen"]) if st["seen"] > 0 else 0.0
+                    target_pos = 1 if ratio <= 0.375 else (2 if ratio <= 0.625 else 3)
+                    target_pos = min(target_pos, final_keep_per_prompt - 1)
+                    if len(pos_cache[uid]) >= target_pos and uid in first4_cache:
+                        # 选正样本片段
                         pos_frags = pos_cache[uid][:target_pos]
-                        neg_frags = neg_cache[uid][:target_neg]
-                        frags_to_cat = pos_frags + neg_frags
+                        # 用前4补负样本若干行
+                        neg_need = final_keep_per_prompt - len(pos_frags)
+                        frags_to_cat = []
+                        frags_to_cat.extend(pos_frags)
+                        if neg_need > 0:
+                            n_first4 = _dp_rows(first4_cache[uid])
+                            idxs = list(range(min(neg_need, n_first4)))
+                            if idxs:
+                                frags_to_cat.append(first4_cache[uid][idxs])
 
-                        if len(frags_to_cat) == final_keep_per_prompt:
-                            merged = concat_dataproto_fragments(frags_to_cat)
+                        if frags_to_cat and not st["finished"]:
+                            merged = _dp_cat(frags_to_cat)
                             selected_pool_batches.append(merged)
-                            selected_count_by_uid[uid] = get_first_dim_size(merged)
+                            selected_count_by_uid[uid] = _dp_rows(merged)
                             st["finished"] = True
-                            completed_this_round += 1
+                        else:
+                            if not frags_to_cat:
+                                print(f"[warn] uid={uid} 收敛时片段为空，请检查阈值/缓存。")
 
-            # Update active set
+            # 本轮完成后的活跃集合
             active_uids = {u for u in active_uids if not state[u]["finished"]}
 
-            # Record timing and stats
             sec = time.time() - t0
             if timing_raw is not None:
                 timing_raw[f"gen_round_{r}_sec"] = sec
 
-            rounds_info["per_round"].append(
-                {
-                    "round": r,
-                    "active_prompts": len(per_uid_local_idx),
-                    "completed": completed_this_round,
-                    "finished_prompts": sum(1 for s in state.values() if s["finished"]),
-                    "reward_mean": float(np.mean(seq_reward_np)) if seq_reward_np else 0.0,
-                    "sec": round(sec, 3),
-                }
-            )
-            print(
-                f"[Gen-Round {r}] active_prompts={len(per_uid_local_idx)} "
-                f"completed={completed_this_round} "
+            rounds_info["per_round"].append({
+                "round": r,
+                "active_prompts": len(per_uid_local_idx),
+                "made_positive": made_positive_this_round,
+                "finished_prompts": sum(1 for s in state.values() if s["finished"]),
+                "reward_mean": float(np.mean(seq_reward_np)) if seq_reward_np else 0.0,
+                "sec": round(sec, 3),
+            })
+            print(f"[Gen-Round {r}] active_prompts={len(per_uid_local_idx)} "
+                f"made_positive={made_positive_this_round} "
                 f"finished={rounds_info['per_round'][-1]['finished_prompts']} "
                 f"time={sec:.3f}s "
-                f"reward_mean={rounds_info['per_round'][-1]['reward_mean']:.4f}"
-            )
+                f"reward_mean={rounds_info['per_round'][-1]['reward_mean']:.4f}")
 
             if not active_uids:
                 break
 
-        # Handle fallback for uids that didn't reach target
-        uids_that_need_fallback = {uid for uid in uid_arr if not state[uid]["finished"]}
-
+        # 兜底：剩余 uid 用前4片段（若存在）
+        uids_that_need_fallback = {uid for uid in uid_arr if selected_count_by_uid.get(uid, 0) == 0}
         for uid in uids_that_need_fallback:
-            if uid in pos_cache or uid in neg_cache:
-                pos_num = len(pos_cache[uid])
-                neg_num = len(neg_cache[uid])
-                n_rows = pos_num + neg_num
+            if uid in first4_cache and first4_cache[uid] is not None:
+                n_rows = _dp_rows(first4_cache[uid])
                 take = min(final_keep_per_prompt, n_rows)
-
-                if n_rows < final_keep_per_prompt:
-                    print(
-                        f"[WARN] uid={uid} has {n_rows} samples, less than target "
-                        f"{final_keep_per_prompt}, but continuing"
-                    )
-
-                # Try to maintain 1:1 positive:negative balance
-                actual_pos = min(pos_num, target_pos)
-                actual_neg = min(neg_num, target_neg)
-
-                # If one type is insufficient, fill with the other
-                if actual_pos + actual_neg < take:
-                    if pos_num > actual_pos:
-                        additional_pos = min(pos_num - actual_pos, take - actual_pos - actual_neg)
-                        actual_pos += additional_pos
-                    elif neg_num > actual_neg:
-                        additional_neg = min(neg_num - actual_neg, take - actual_pos - actual_neg)
-                        actual_neg += additional_neg
-
-                keep_pos = actual_pos
-                keep_neg = actual_neg
-                pos_frags = pos_cache[uid][:keep_pos] if keep_pos > 0 else []
-                neg_frags = neg_cache[uid][:keep_neg] if keep_neg > 0 else []
-                frags_to_merge = pos_frags + neg_frags
-
-                if frags_to_merge:
-                    merged = concat_dataproto_fragments(frags_to_merge)
-                    selected_pool_batches.append(merged)
-                    selected_count_by_uid[uid] = get_first_dim_size(merged)
-                else:
-                    print(f"[WARN] uid={uid} frags_to_merge is empty, cannot fallback")
+                frag = first4_cache[uid][:take] if take < n_rows else first4_cache[uid]
+                selected_pool_batches.append(frag)
+                selected_count_by_uid[uid] = take
             else:
-                print(f"[WARN] uid={uid} not in pos_cache or neg_cache, cannot fallback")
+                print(f"[warn] uid={uid} 没有 first4_cache，无法兜底。")
 
-        if not selected_pool_batches:
-            raise RuntimeError(
-                "No samples selected after early stopping. Check if threshold/rules are too strict or data is abnormal"
-            )
+        assert len(selected_pool_batches) > 0, "早停后没有选中样本，请检查阈值/规则是否过严或数据是否异常"
 
-        # Concatenate all selected samples
-        selected_batch = concat_dataproto_fragments(selected_pool_batches)
+        # 选中样本拼接
+        selected_batch = _dp_cat(selected_pool_batches)
+        # === 构造与 selected_batch 行数一致的“对齐 context 行视图”（仅用于取字段，不做 union）===
+        def _align_ctx_rows_to_selected(selected: DataProto, ctx: DataProto) -> DataProto:
+            import numpy as np
+            # 取 selected 的 uid 序列
+            if "uid" not in selected.non_tensor_batch:
+                raise KeyError("selected_batch 缺少 uid，无法对齐 context。")
+            sel_uids = list(selected.non_tensor_batch["uid"])
 
-        # Align context fields to selected batch
+            # ctx 必须有 uid
+            if "uid" not in ctx.non_tensor_batch:
+                raise KeyError("context_batch 缺少 uid，无法对齐。")
+            ctx_uids = list(ctx.non_tensor_batch["uid"])
+
+            # 建立 uid -> 首次出现的行索引
+            uid_to_idx = {}
+            for i, u in enumerate(ctx_uids):
+                if u not in uid_to_idx:
+                    uid_to_idx[u] = i
+
+            # 依顺序对齐到 selected 的行
+            idxs = []
+            miss = []
+            for i, u in enumerate(sel_uids):
+                j = uid_to_idx.get(u, None)
+                if j is None:
+                    miss.append((i, u))
+                else:
+                    idxs.append(j)
+            if miss:
+                examples = miss[:5]
+                raise KeyError(f"context_batch 中找不到部分 uid，样例: {examples}")
+
+            return ctx[idxs]
+
+        # 选择 context 来源
         _context_src = context_batch if context_batch is not None else orig_prompt_batch
-        ctx_rows = align_context_to_selected(selected_batch, _context_src)
+        ctx_rows = _align_ctx_rows_to_selected(selected_batch, _context_src)
 
-        # Merge missing fields from context into selected batch
-        merge_context_fields_into_batch(selected_batch, ctx_rows)
+        # === 把 ctx_rows 的缺失键直接 merge 进 selected_batch（不覆盖已有键）===
+        # 1) 非张量键
+        for k, v in ctx_rows.non_tensor_batch.items():
+            if k not in selected_batch.non_tensor_batch:
+                selected_batch.non_tensor_batch[k] = v
 
+        # 2) 张量键（很少需要；仅当 selected_batch 里没有该张量时才补）
+        # 2) 张量键（仅当 selected_batch 没有该张量时才补；显式判空，避免 TensorDict 布尔判断）
+        ctx_batch = getattr(ctx_rows, "batch", None)
+        if ctx_batch is not None:
+            n_selected = _first_dim_size(selected_batch)
+            # 兼容 dict / TensorDict：两者都有 .items()
+            for k, v in ctx_batch.items():
+                if k in selected_batch.batch:
+                    continue
+                if v.shape[0] != n_selected:
+                    raise ValueError(
+                        f"ctx_rows.batch['{k}'] 行数({v.shape[0]}) != selected_batch({n_selected})"
+                    )
+                selected_batch.batch[k] = v
+
+
+        # 最终 batch 就是已经补齐上下文字段的 selected_batch
         final_batch = selected_batch
 
-        # Ensure token_level_scores exists (fallback to token_level_rewards)
+
+        # 🔒 兜底：确保最终 batch 一定带有 token_level_scores
         if "token_level_scores" not in final_batch.batch and "token_level_rewards" in final_batch.batch:
             final_batch.batch["token_level_scores"] = final_batch.batch["token_level_rewards"]
 
-        # Validate that we maintained efficient TensorDict structure
-        validate_tensordict_performance(final_batch, context="final_batch")
-
         return final_batch, rounds_info
+
+
+
+
 
     def fit(self):
         """
@@ -1175,6 +1382,7 @@ class RayPPOTrainer:
         The light-weight advantage computation is done on the driver process.
         """
         from omegaconf import OmegaConf
+
         from verl.utils.tracking import Tracking
 
         logger = Tracking(
@@ -1242,112 +1450,63 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-
+                
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
-                    # generate a batch
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REINFORCE_ADA:
-                        with marked_timer("gen_multi_round", timing_raw, color="red"):
-                            final_batch, rounds_info = self._generate_multi_round_with_early_downsampling(
-                                orig_prompt_batch=gen_batch,
-                                positive_threshold=self.config.algorithm.positive_threshold,
-                                max_rounds=self.config.algorithm.max_rounds,
-                                round_repeat=self.config.algorithm.round_repeat,
-                                final_keep_per_prompt=self.config.actor_rollout_ref.rollout.n,
-                                timing_raw=timing_raw,
-                                context_batch=batch,
-                            )
+                    # 可调参数
+                    positive_threshold = 0.7
+                    actual_repeat = 32
+                    round_repeat = 4           # 每轮为活跃 prompt 生成4条
+                    final_keep_per_prompt = 4  # 每个 prompt 最终保留4条
 
-                        total_prompts = len(set(gen_batch.non_tensor_batch["uid"]))
-                        print(
-                            f"[Summary] prompts={total_prompts}, selected_rows={len(final_batch)}, "
-                            f"max_rounds={self.config.algorithm.max_rounds}"
+                    with marked_timer("gen_multi_round", timing_raw, color="red"):
+                        # 函数已返回对齐合并后的“最终 batch”
+                        final_batch, rounds_info = self._generate_multi_round_with_early_downsampling(
+                            orig_prompt_batch=gen_batch,
+                            positive_threshold=positive_threshold,
+                            actual_repeat=actual_repeat,
+                            round_repeat=round_repeat,
+                            final_keep_per_prompt=final_keep_per_prompt,
+                            timing_raw=timing_raw,
+                            context_batch=batch,  # 用于补齐非张量字段（uid 映射等）
                         )
-                        if rounds_info.get("per_round"):
-                            for info in rounds_info["per_round"]:
-                                print(
-                                    f"  - round {info['round']}: active={info['active_prompts']}, "
-                                    f"completed={info['completed']}, finished={info['finished_prompts']}, "
-                                    f"time={info['sec']}s"
-                                )
 
-                        metrics["sampling/total_samples"] = np.sum(
-                            [
-                                (info["active_prompts"] * self.config.algorithm.round_repeat)
-                                for info in rounds_info["per_round"]
-                            ]
-                        )
-                        metrics["sampling/prompts_active_only_1st_round"] = rounds_info["per_round"][0][
-                            "finished_prompts"
-                        ]
+                    # 小结打印（也可写到 metrics）
+                    total_prompts = len(set(gen_batch.non_tensor_batch["uid"]))
+                    print(f"[Summary] prompts={total_prompts}, selected_rows={len(final_batch)}, "
+                        f"max_rounds={actual_repeat // round_repeat}")
+                    if rounds_info.get("per_round"):
+                        try:
+                            finished_prompts = rounds_info["per_round"][-1]["finished_prompts"]
+                        except Exception:
+                            finished_prompts = 0
+                        for info in rounds_info["per_round"]:
+                            print(f"  - round {info['round']}: active={info['active_prompts']}, "
+                                f"made_pos={info['made_positive']}, finished={info['finished_prompts']}, "
+                                f"time={info['sec']}s")
 
-                        if len(rounds_info["per_round"]) > 1:
-                            metrics["sampling/prompts_active_after_1st_round"] = rounds_info["per_round"][1][
-                                "active_prompts"
-                            ] - (
-                                rounds_info["per_round"][0]["active_prompts"]
-                                - rounds_info["per_round"][-1]["finished_prompts"]
-                            )
-                        else:
-                            metrics["sampling/prompts_active_after_1st_round"] = 0
-
-                        metrics["sampling/prompts_no_positive_anywhere"] = (
-                            rounds_info["per_round"][0]["active_prompts"]
-                            - rounds_info["per_round"][-1]["finished_prompts"]
-                        )
-                        metrics["sampling/kept_samples"] = len(final_batch)
-                        metrics["critic/real_reward"] = rounds_info["per_round"][0]["reward_mean"]
-                        metrics["sampling/downsampled_samples"] = len(final_batch)
-                        metrics["sampling/total_prompts"] = total_prompts
-
-                        batch = final_batch
-
+                    metrics["sampling/total_samples"] = np.sum([(info["active_prompts"] * round_repeat) for info in rounds_info["per_round"]])
+                    metrics["sampling/prompts_active_only_1st_round"] = rounds_info["per_round"][0]["finished_prompts"]
+                    
+                    # 安全地访问第二轮信息
+                    if len(rounds_info["per_round"]) > 1:
+                        metrics["sampling/prompts_active_after_1st_round"] = rounds_info["per_round"][1]["active_prompts"] - (rounds_info["per_round"][0]["active_prompts"] - rounds_info["per_round"][-1]["finished_prompts"])
                     else:
-                        with marked_timer("gen", timing_raw, color="red"):
-                            gen_batch = gen_batch.repeat(
-                                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                            )
+                        metrics["sampling/prompts_active_after_1st_round"] = 0
+                    
+                    metrics["sampling/prompts_no_positive_anywhere"] = rounds_info["per_round"][0]["active_prompts"] - rounds_info["per_round"][-1]["finished_prompts"]
+                    metrics['sampling/kept_samples'] = len(final_batch)
 
-                            if not self.async_rollout_mode:
-                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                            else:
-                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                            timing_raw.update(gen_batch_output.meta_info["timing"])
-                            gen_batch_output.meta_info.pop("timing", None)
 
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                            if self.reward_fn is None:
-                                raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+                    # ✅ 关键：不要再 repeat / union 了，直接用最终 batch
+                    batch = final_batch
 
-                            with marked_timer("gen_max", timing_raw, color="purple"):
-                                gen_baseline_batch = deepcopy(gen_batch)
-                                gen_baseline_batch.meta_info["do_sample"] = False
-                                if not self.async_rollout_mode:
-                                    gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                                else:
-                                    gen_baseline_output = self.async_rollout_manager.generate_sequences(
-                                        gen_baseline_batch
-                                    )
-                                batch = batch.union(gen_baseline_output)
-                                reward_baseline_tensor = self.reward_fn(batch)
-                                reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                                batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                                batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                                del gen_baseline_batch, gen_baseline_output
-
-                        # repeat to align with repeated responses in rollout
-                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                        batch = batch.union(gen_batch_output)
-
-                    if "response_mask" not in batch.batch.keys():
+                    # 之后保持不变（mask/balance/kl/adv/损失等）...
+                    if "response_mask" not in batch.batch:
                         batch.batch["response_mask"] = compute_response_mask(batch)
-
-                    # Balance the number of valid tokens across DP ranks.
                     if self.config.trainer.balance_batch:
+                        # Check if batch size is divisible by world_size for balancing
                         world_size = self.actor_rollout_wg.world_size
                         batch_size = len(batch)
                         if batch_size % world_size == 0:
@@ -1356,34 +1515,21 @@ class RayPPOTrainer:
                             # Pad the batch to make it divisible by world_size
                             padding_needed = world_size - (batch_size % world_size)
                             print(f"Padding batch from {batch_size} to {batch_size + padding_needed} for balancing")
-
+                            
+                            # Randomly choose samples to pad
                             indices_to_repeat = random.choices(range(batch_size), k=padding_needed)
                             padding_batch = batch[indices_to_repeat]
                             batch = DataProto.concat([batch, padding_batch])
-
-                            if hasattr(batch.batch, "__class__"):
-                                batch_type = batch.batch.__class__.__name__
-                                if "TensorDict" not in batch_type and "dict" in batch_type.lower():
-                                    print(
-                                        f"[perf_warn] After padding batch.batch is plain {batch_type}, may affect performance"
-                                    )
-
+                            
+                            # Now balance the padded batch
                             self._balance_batch(batch, metrics=metrics)
-                    batch.batch = batch.batch.contiguous()
-
-                    # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    # (可选) 记录真实平均奖励（以最终保留样本为准）
+                    all_seq_rewards = batch.batch["token_level_rewards"].sum(dim=-1).detach().cpu().numpy()
+                    metrics["critic/real_reward"] = rounds_info["per_round"][0]["reward_mean"]
+                    metrics["sampling/downsampled_samples"] = len(batch)           # 实际用于训练的样本数
+                    metrics["sampling/total_prompts"] = total_prompts
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1419,29 +1565,10 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # reward processing and downsampling already done in multi-round generation
-                        if self.config.algorithm.adv_estimator != AdvantageEstimator.REINFORCE_ADA:
-                            # we combine with rule-based rm
-                            reward_extra_infos_dict: dict[str, list]
-                            if self.config.reward_model.launch_reward_fn_async:
-                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                            batch.batch["token_level_scores"] = reward_tensor
-
-                            if reward_extra_infos_dict:
-                                batch.non_tensor_batch.update(
-                                    {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
-                                )
-
-                            # compute rewards. apply_kl_penalty if available
-                            if self.config.algorithm.use_kl_in_reward:
-                                batch, kl_metrics = apply_kl_penalty(
-                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                                )
-                                metrics.update(kl_metrics)
-                            else:
-                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
+                        # Note: reward processing and downsampling already done above
+                        #######################
                         # compute advantages, executed on the driver process
+
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor

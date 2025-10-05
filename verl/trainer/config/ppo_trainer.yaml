@@ -84,15 +84,11 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
-  filter_max_round: 4
-  filter_min_positive_samples: 4
-  filter_positive_threshold: 0.9
-  filter_max_total_samples_per_prompt: 8
-  filter_max_positive_samples_per_prompt: 4
-
-  # Whether to use global statistics for advantage estimation (specific to GRPO)
+  # Reinforce_Ada specific
+  positive_threshold: 0.7
+  max_rounds: 4
+  round_repeat: 8
   global_stat_est: False
-
   clip_stats: False
 
   # Whether to enable in-reward KL penalty

@@ -85,11 +85,10 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
-    filter_max_round: int = 4
-    filter_min_positive_samples: int = 4
-    filter_positive_threshold: float = 0.9
-    filter_max_total_samples_per_prompt: int = 8
-    filter_max_positive_samples_per_prompt: int = 4
+
+    # Function when adv_estimator == "reinforce_ada"
+    positive_threshold: float = 0.7
+    max_rounds: int = 4
+    round_repeat: int = 8
     global_stat_est: bool = False
     clip_stats: bool = False
-
