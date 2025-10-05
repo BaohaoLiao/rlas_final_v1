@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import math
 import random
 import json
 import os
@@ -952,9 +953,6 @@ class RayPPOTrainer:
                 - final_batch: DataProto with selected samples and aligned context fields
                 - rounds_info: Dict with per-round statistics
         """
-        target_pos = final_keep_per_prompt // 2
-        target_neg = final_keep_per_prompt - target_pos
-
         # Build uid -> fields mapping from context
         ctx_uid_to_fields = {}
         if context_batch is not None:
@@ -1070,17 +1068,55 @@ class RayPPOTrainer:
 
                 # Check if we have enough samples to finish this uid
                 if not st["finished"]:
-                    if len(pos_cache[uid]) >= target_pos and len(neg_cache[uid]) >= target_neg:
-                        pos_frags = pos_cache[uid][:target_pos]
-                        neg_frags = neg_cache[uid][:target_neg]
-                        frags_to_cat = pos_frags + neg_frags
+                    if self.config.algorithm.reinforce_ada_choice == "balance":
+                        target_pos = final_keep_per_prompt // 2
+                        target_neg = final_keep_per_prompt - target_pos
 
-                        if len(frags_to_cat) == final_keep_per_prompt:
-                            merged = concat_dataproto_fragments(frags_to_cat)
-                            selected_pool_batches.append(merged)
-                            selected_count_by_uid[uid] = get_first_dim_size(merged)
-                            st["finished"] = True
-                            completed_this_round += 1
+                        if len(pos_cache[uid]) >= target_pos and len(neg_cache[uid]) >= target_neg:
+                            pos_frags = pos_cache[uid][:target_pos]
+                            neg_frags = neg_cache[uid][:target_neg]
+                            frags_to_cat = pos_frags + neg_frags
+
+                            if len(frags_to_cat) == final_keep_per_prompt:
+                                merged = concat_dataproto_fragments(frags_to_cat)
+                                selected_pool_batches.append(merged)
+                                selected_count_by_uid[uid] = get_first_dim_size(merged)
+                                st["finished"] = True
+                                completed_this_round += 1
+
+                    else:  # psitive-focused
+                        assert self.config.algorithm.reinforce_ada_choice == "positive-focused", (
+                            "reinforce_ada_choice has to be one of {'balance', 'positive-focused'}"
+                        )
+                        ratio = (st["pos"] / st["seen"]) if st["seen"] > 0 else 0.0
+                        target_pos = math.ceil(ratio * final_keep_per_prompt)
+                        target_pos = max(min(target_pos, final_keep_per_prompt - 1), 1)
+                        target_neg = final_keep_per_prompt - target_pos
+
+                        if len(pos_cache[uid]) >= target_pos:
+                            pos_frags = pos_cache[uid][:target_pos]
+                            available_neg = len(neg_cache[uid])
+                            neg_frags = neg_cache[uid][: min(target_neg, available_neg)]
+
+                            # If not sufficient negative samples, use positive samples to make up
+                            current_total = len(pos_frags) + len(neg_frags)
+                            if current_total < final_keep_per_prompt:
+                                additional_pos_needed = final_keep_per_prompt - current_total
+                                available_additional_pos = len(pos_cache[uid]) - target_pos
+                                additional_pos = min(additional_pos_needed, available_additional_pos)
+                                if additional_pos > 0:
+                                    extra_pos_frags = pos_cache[uid][target_pos : target_pos + additional_pos]
+                                    pos_frags = pos_frags + extra_pos_frags
+
+                            frags_to_cat = pos_frags + neg_frags
+
+                            # exit condition: sufficient positive samples
+                            if len(pos_cache[uid][:target_pos]) >= target_pos:
+                                merged = concat_dataproto_fragments(frags_to_cat)
+                                selected_pool_batches.append(merged)
+                                selected_count_by_uid[uid] = get_first_dim_size(merged)
+                                st["finished"] = True
+                                completed_this_round += 1
 
             # Update active set
             active_uids = {u for u in active_uids if not state[u]["finished"]}
@@ -1127,7 +1163,13 @@ class RayPPOTrainer:
                         f"{final_keep_per_prompt}, but continuing"
                     )
 
-                # Try to maintain 1:1 positive:negative balance
+                if self.config.algorithm.reinforce_ada_choice == "positive_focused":
+                    ratio = (pos_num / n_rows) if n_rows > 0 else 0.0
+                    target_pos = math.ceil(ratio * final_keep_per_prompt)
+
+                    target_pos = max(min(target_pos, take - 1), 1)
+                    target_neg = take - target_pos
+
                 actual_pos = min(pos_num, target_pos)
                 actual_neg = min(neg_num, target_neg)
 

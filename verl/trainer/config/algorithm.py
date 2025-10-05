@@ -88,6 +88,7 @@ class AlgoConfig(BaseConfig):
 
     # Reinforce_Ada specific
     multiround_adaptive_downsampling: bool = False
+    reinforce_ada_choice: str = "balance"  # or "positive-focused" when multiround_adaptive_downsampling is True
     positive_threshold: float = 0.7
     max_rounds: int = 4
     round_repeat: int = 8

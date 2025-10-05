@@ -86,6 +86,7 @@ algorithm:
 
   # Reinforce_Ada specific
   multiround_adaptive_downsampling: False
+  reinforce_ada_choice: "balance"
   positive_threshold: 0.7
   max_rounds: 4
   round_repeat: 8
@@ -218,18 +219,6 @@ trainer:
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
-
-  # whether to use uniform worker implementation
-  uniform_trainer: False
-
-  # whether to use adaptive trainer implementation
-  adaptive_trainer: False
-
-  adaptive_reuse_trainer: False
-
-  gen8_balanced_trainer: False
-
-  positive_trainer: False
 
 
 # profiler configs
