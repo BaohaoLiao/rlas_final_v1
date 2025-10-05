@@ -1166,7 +1166,6 @@ class RayPPOTrainer:
                 if self.config.algorithm.reinforce_ada_choice == "positive_focused":
                     ratio = (pos_num / n_rows) if n_rows > 0 else 0.0
                     target_pos = math.ceil(ratio * final_keep_per_prompt)
-
                     target_pos = max(min(target_pos, take - 1), 1)
                     target_neg = take - target_pos
 
