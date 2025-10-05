@@ -1,5 +1,5 @@
 """
-Utility functions for DataProto manipulation in multi-round generation with early downsampling.
+Utility functions for DataProto manipulation in multi-round generation with adaptive downsampling.
 """
 
 import numpy as np

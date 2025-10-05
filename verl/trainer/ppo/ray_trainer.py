@@ -258,6 +258,14 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
+
+        # For GRPO with global stats estimation, get the global pos/neg counts
+        grpo_uid_to_pos_count = None
+        grpo_uid_to_neg_count = None
+        if hasattr(data, "meta_info") and data.meta_info is not None:
+            grpo_uid_to_pos_count = data.meta_info.get("grpo_uid_to_pos_count", None)
+            grpo_uid_to_neg_count = data.meta_info.get("grpo_uid_to_neg_count", None)
+
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -265,6 +273,8 @@ def compute_advantage(
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
+            grpo_uid_to_pos_count=grpo_uid_to_pos_count,
+            grpo_uid_to_neg_count=grpo_uid_to_neg_count,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -962,6 +972,8 @@ class RayPPOTrainer:
         neg_cache = defaultdict(list)
         selected_pool_batches: list[DataProto] = []
         selected_count_by_uid = defaultdict(int)
+        # For GRPO with global statistics estimation
+        uid_full_stats = {uid: {"total_pos": 0, "total_neg": 0} for uid in uid_arr}
         rounds_info = {"per_round": []}
 
         # Main generation loop
@@ -1050,9 +1062,11 @@ class RayPPOTrainer:
                     if is_positive:
                         st["pos"] += 1
                         pos_cache[uid].append(mini_with_out[[j]])
+                        uid_full_stats[uid]["total_pos"] += 1
                     else:
                         st["neg"] += 1
                         neg_cache[uid].append(mini_with_out[[j]])
+                        uid_full_stats[uid]["total_neg"] += 1
 
                 # Check if we have enough samples to finish this uid
                 if not st["finished"]:
@@ -1162,6 +1176,15 @@ class RayPPOTrainer:
         if "token_level_scores" not in final_batch.batch and "token_level_rewards" in final_batch.batch:
             final_batch.batch["token_level_scores"] = final_batch.batch["token_level_rewards"]
 
+        # For GRPO with global stats, log pos/neg counts
+        uid_to_pos_count = {uid: stats["total_pos"] for uid, stats in uid_full_stats.items()}
+        uid_to_neg_count = {uid: stats["total_neg"] for uid, stats in uid_full_stats.items()}
+
+        if not hasattr(final_batch, "meta_info") or final_batch.meta_info is None:
+            final_batch.meta_info = {}
+        final_batch.meta_info["grpo_uid_to_pos_count"] = uid_to_pos_count
+        final_batch.meta_info["grpo_uid_to_neg_count"] = uid_to_neg_count
+
         # Validate that we maintained efficient TensorDict structure
         validate_tensordict_performance(final_batch, context="final_batch")
 
@@ -1247,7 +1270,7 @@ class RayPPOTrainer:
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
-                    if self.config.algorithm.multiround_downsampling:
+                    if self.config.algorithm.multiround_adaptive_downsampling:
                         with marked_timer("gen_multi_round", timing_raw, color="red"):
                             final_batch, rounds_info = self._generate_multi_round_adaptive_downsampling(
                                 orig_prompt_batch=gen_batch,
@@ -1420,7 +1443,7 @@ class RayPPOTrainer:
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # reward processing and downsampling already done in multi-round generation
-                        if not self.config.algorithm.multiround_downsampling:
+                        if not self.config.algorithm.multiround_adaptive_downsampling:
                             # we combine with rule-based rm
                             reward_extra_infos_dict: dict[str, list]
                             if self.config.reward_model.launch_reward_fn_async:
