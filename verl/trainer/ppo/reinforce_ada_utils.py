@@ -8,7 +8,7 @@ import torch
 import ray
 from verl import DataProto
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.ray_trainer_gen8_balance import apply_kl_penalty
+from verl.trainer.ppo.ray_trainer import apply_kl_penalty
 
 
 def get_first_dim_size(dp: DataProto) -> int:
