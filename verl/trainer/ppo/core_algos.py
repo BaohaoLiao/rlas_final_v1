@@ -102,7 +102,6 @@ class AdvantageEstimator(str, Enum):
     OPO = "opo"
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
-    REINFORCE_ADA = "reinforce_ada"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -259,7 +258,6 @@ def compute_gae_advantage_return(
 
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
-@register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -267,6 +265,8 @@ def compute_grpo_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    grpo_uid_to_pos_count: Optional[dict[Any, int]] = None,
+    grpo_uid_to_neg_count: Optional[dict[Any, int]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -296,34 +296,201 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)
 
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
+    if config.get("global_stat_est", False):
+        print("Using global statistics for GRPO advantage calculation.")
+        scores = token_level_rewards.sum(dim=-1)
 
-    with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                scores_tensor = torch.stack(id2score[idx])
-                id2mean[idx] = torch.mean(scores_tensor)
-                id2std[idx] = torch.std(scores_tensor)
+        id2score = defaultdict(list)
+        id2mean = {}
+        id2std = {}
+
+        with torch.no_grad():
+            bsz = scores.shape[0]
+
+            # 如果提供了全量统计信息，使用这些信息计算mean和std
+            if grpo_uid_to_pos_count is not None and grpo_uid_to_neg_count is not None:
+                # 首先收集每个uid的当前samples用于计算
+                for i in range(bsz):
+                    id2score[index[i]].append(scores[i])
+
+                print("\n" + "=" * 80)
+                print("GRPO Advantage Calculation with Full Sampling Statistics")
+                print("=" * 80)
+
+                # 使用全量统计信息计算每个uid的真实mean和std
+                uid_to_full_stats = {}
+                uid_to_downsampled_stats = {}
+                debug_examples = []
+
+                for i in range(bsz):
+                    uid = index[i]
+                    if uid not in uid_to_full_stats:
+                        # 从字典中安全地获取统计信息
+                        pos_count = grpo_uid_to_pos_count.get(uid, 0)
+                        neg_count = grpo_uid_to_neg_count.get(uid, 0)
+                        total_count = pos_count + neg_count
+
+                        # 验证总样本数是8的倍数
+                        if total_count % 8 != 0:
+                            print(f"[WARNING] UID {uid}: total_count={total_count} 不是8的倍数!")
+
+                        if total_count == 0:
+                            # 没有任何样本的情况（理论上不应该发生）
+                            uid_to_full_stats[uid] = {"mean": 0.0, "std": 1.0}
+                        elif total_count == 1:
+                            # 只有一个样本，advantage为0
+                            uid_to_full_stats[uid] = {"mean": 0.0, "std": 1.0}
+                        else:
+                            # 直接构造全量样本tensor并计算真实的mean和std
+                            # 构造包含所有正负样本的tensor（正样本=1.0，负样本=0.0）
+                            if pos_count > neg_count and config.get("clip_stats", False):
+                                print("clip for simple majority positive samples")
+                                n = (pos_count + neg_count) // 2
+                                all_samples = torch.cat([torch.ones(n), torch.zeros(n)])
+                            else:
+                                all_samples = torch.cat(
+                                    [
+                                        torch.ones(pos_count),  # 正样本
+                                        torch.zeros(neg_count),  # 负样本
+                                    ]
+                                )
+                            mean_val = torch.mean(all_samples).item()
+                            std_val = max(torch.std(all_samples).item(), epsilon)  # 避免std为0
+                            uid_to_full_stats[uid] = {"mean": mean_val, "std": std_val}
+
+                        # 计算当前下采样样本的mean和std
+                        if len(id2score[uid]) > 1:
+                            downsampled_tensor = torch.stack(id2score[uid])
+                            downsampled_mean = torch.mean(downsampled_tensor).item()
+                            downsampled_std = torch.std(downsampled_tensor).item()
+                            uid_to_downsampled_stats[uid] = {"mean": downsampled_mean, "std": downsampled_std}
+                        else:
+                            uid_to_downsampled_stats[uid] = {"mean": 0.0, "std": 1.0}
+
+                        # 验证全正或全负的一致性
+                        is_full_positive = pos_count > 0 and neg_count == 0
+                        is_full_negative = pos_count == 0 and neg_count > 0
+                        is_downsampled_all_positive = all(s.item() > 0.5 for s in id2score[uid])  # 假设positive=1.0
+                        is_downsampled_all_negative = all(s.item() < 0.5 for s in id2score[uid])  # 假设negative=0.0
+
+                        if is_full_positive and not is_downsampled_all_positive:
+                            print(f"[ERROR] UID {uid}: 全量样本全正，但下采样样本不全正!")
+                        if is_full_negative and not is_downsampled_all_negative:
+                            print(f"[ERROR] UID {uid}: 全量样本全负，但下采样样本不全负!")
+                        if is_downsampled_all_positive and not is_full_positive:
+                            print(f"[ERROR] UID {uid}: 下采样样本全正，但全量样本不全正!")
+                        if is_downsampled_all_negative and not is_full_negative:
+                            print(f"[ERROR] UID {uid}: 下采样样本全负，但全量样本不全负!")
+
+                        # 当全正或全负时，验证mean和std的一致性
+                        if is_full_positive or is_full_negative:
+                            full_mean = uid_to_full_stats[uid]["mean"]
+                            full_std = uid_to_full_stats[uid]["std"]
+                            down_mean = uid_to_downsampled_stats[uid]["mean"]
+                            down_std = uid_to_downsampled_stats[uid]["std"]
+
+                            if abs(full_mean - down_mean) > 1e-6:
+                                print(
+                                    f"[ERROR] UID {uid}: 全正/全负时mean不一致! full={full_mean:.6f}, down={down_mean:.6f}"
+                                )
+                            if abs(full_std - down_std) > 1e-6:
+                                print(
+                                    f"[ERROR] UID {uid}: 全正/全负时std不一致! full={full_std:.6f}, down={down_std:.6f}"
+                                )
+
+                        # 收集调试例子 - 总是添加，最后取最后10个
+                        debug_examples.append(
+                            {
+                                "uid": uid,
+                                "pos_count": pos_count,
+                                "neg_count": neg_count,
+                                "total_count": total_count,
+                                "full_mean": uid_to_full_stats[uid]["mean"],
+                                "full_std": uid_to_full_stats[uid]["std"],
+                                "down_mean": uid_to_downsampled_stats[uid]["mean"],
+                                "down_std": uid_to_downsampled_stats[uid]["std"],
+                                "downsampled_scores": [s.item() for s in id2score[uid]],
+                            }
+                        )
+
+                # 打印调试例子 - 取最后10个
+                examples_to_show = debug_examples[-10:] if len(debug_examples) > 10 else debug_examples
+                print(f"\n调试例子 (最后{len(examples_to_show)}个UID):")
+                print("-" * 120)
+                print(
+                    f"{'UID':<8} {'Pos':<4} {'Neg':<4} {'Total':<6} {'Full_Mean':<10} {'Full_Std':<10} {'Down_Mean':<10} {'Down_Std':<10} {'Downsampled_Scores'}"
+                )
+                print("-" * 120)
+                for ex in examples_to_show:
+                    scores_str = str(ex["downsampled_scores"][:6])  # 只显示前6个
+                    if len(ex["downsampled_scores"]) > 6:
+                        scores_str = scores_str[:-1] + "...]"
+                    print(
+                        f"{str(ex['uid']):<8} {ex['pos_count']:<4} {ex['neg_count']:<4} {ex['total_count']:<6} "
+                        f"{ex['full_mean']:<10.4f} {ex['full_std']:<10.4f} {ex['down_mean']:<10.4f} {ex['down_std']:<10.4f} {scores_str}"
+                    )
+                print("-" * 120)
+
+                # 将计算出的stats映射到id2mean和id2std
+                for uid, stats in uid_to_full_stats.items():
+                    id2mean[uid] = torch.tensor(stats["mean"])
+                    id2std[uid] = torch.tensor(stats["std"])
+
             else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-            else:
-                scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+                # 回退到原始逻辑：使用下采样后的样本计算mean和std
+                for i in range(bsz):
+                    id2score[index[i]].append(scores[i])
+                for idx in id2score:
+                    if len(id2score[idx]) == 1:
+                        id2mean[idx] = torch.tensor(0.0)
+                        id2std[idx] = torch.tensor(1.0)
+                    elif len(id2score[idx]) > 1:
+                        scores_tensor = torch.stack(id2score[idx])
+                        id2mean[idx] = torch.mean(scores_tensor)
+                        id2std[idx] = torch.std(scores_tensor)
+                    else:
+                        raise ValueError(f"no score in prompt index: {idx}")
 
-    return scores, scores
+            # 应用advantage计算
+            for i in range(bsz):
+                if norm_adv_by_std_in_grpo:
+                    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                else:
+                    scores[i] = scores[i] - id2mean[index[i]]
+            scores = scores.unsqueeze(-1) * response_mask
+
+        return scores, scores
+    else:
+        print("Using local statistics for GRPO advantage calculation.")
+        scores = token_level_rewards.sum(dim=-1)
+
+        id2score = defaultdict(list)
+        id2mean = {}
+        id2std = {}
+
+        with torch.no_grad():
+            bsz = scores.shape[0]
+            for i in range(bsz):
+                id2score[index[i]].append(scores[i])
+            for idx in id2score:
+                if len(id2score[idx]) == 1:
+                    id2mean[idx] = torch.tensor(0.0)
+                    id2std[idx] = torch.tensor(1.0)
+                elif len(id2score[idx]) > 1:
+                    scores_tensor = torch.stack(id2score[idx])
+                    id2mean[idx] = torch.mean(scores_tensor)
+                    id2std[idx] = torch.std(scores_tensor)
+                else:
+                    raise ValueError(f"no score in prompt index: {idx}")
+            for i in range(bsz):
+                if norm_adv_by_std_in_grpo:
+                    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                else:
+                    scores[i] = scores[i] - id2mean[index[i]]
+            scores = scores.unsqueeze(-1) * response_mask
+
+        return scores, scores
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
@@ -684,243 +851,6 @@ def compute_gpg_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
-
-
-# inherit from GRPO implementation
-@register_adv_est(AdvantageEstimator.REINFORCE_ADA)  # or simply: @register_adv_est("reinforce_ada")
-def compute_grpo_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    index: np.ndarray,
-    epsilon: float = 1e-6,
-    norm_adv_by_std_in_grpo: bool = True,
-    config: Optional[AlgoConfig] = None,
-    grpo_uid_to_pos_count: Optional[dict[Any, int]] = None,
-    grpo_uid_to_neg_count: Optional[dict[Any, int]] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for GRPO, operating only on Outcome reward
-    (with only one scalar reward for each response).
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape is (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape is (bs, response_length)
-        index: `(np.ndarray)`
-            index array for grouping
-        epsilon: `(float)`
-            small value to avoid division by zero
-        norm_adv_by_std_in_grpo: `(bool)`
-            whether to scale the GRPO advantage
-        config: `(Optional[AlgoConfig])`
-            algorithm configuration object
-
-    Note:
-        If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
-        If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape is (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape is (bs, response_length)
-    """
-
-    if config.get("global_stat_est", False):
-        print("Using global statistics for GRPO advantage calculation.")
-        scores = token_level_rewards.sum(dim=-1)
-
-        id2score = defaultdict(list)
-        id2mean = {}
-        id2std = {}
-
-        with torch.no_grad():
-            bsz = scores.shape[0]
-
-            # 如果提供了全量统计信息，使用这些信息计算mean和std
-            if grpo_uid_to_pos_count is not None and grpo_uid_to_neg_count is not None:
-                # 首先收集每个uid的当前samples用于计算
-                for i in range(bsz):
-                    id2score[index[i]].append(scores[i])
-
-                print("\n" + "=" * 80)
-                print("GRPO Advantage Calculation with Full Sampling Statistics")
-                print("=" * 80)
-
-                # 使用全量统计信息计算每个uid的真实mean和std
-                uid_to_full_stats = {}
-                uid_to_downsampled_stats = {}
-                debug_examples = []
-
-                for i in range(bsz):
-                    uid = index[i]
-                    if uid not in uid_to_full_stats:
-                        # 从字典中安全地获取统计信息
-                        pos_count = grpo_uid_to_pos_count.get(uid, 0)
-                        neg_count = grpo_uid_to_neg_count.get(uid, 0)
-                        total_count = pos_count + neg_count
-
-                        # 验证总样本数是8的倍数
-                        if total_count % 8 != 0:
-                            print(f"[WARNING] UID {uid}: total_count={total_count} 不是8的倍数!")
-
-                        if total_count == 0:
-                            # 没有任何样本的情况（理论上不应该发生）
-                            uid_to_full_stats[uid] = {"mean": 0.0, "std": 1.0}
-                        elif total_count == 1:
-                            # 只有一个样本，advantage为0
-                            uid_to_full_stats[uid] = {"mean": 0.0, "std": 1.0}
-                        else:
-                            # 直接构造全量样本tensor并计算真实的mean和std
-                            # 构造包含所有正负样本的tensor（正样本=1.0，负样本=0.0）
-                            if pos_count > neg_count and config.get("clip_stats", False):
-                                print("clip for simple majority positive samples")
-                                n = (pos_count + neg_count) // 2
-                                all_samples = torch.cat([torch.ones(n), torch.zeros(n)])
-                            else:
-                                all_samples = torch.cat(
-                                    [
-                                        torch.ones(pos_count),  # 正样本
-                                        torch.zeros(neg_count),  # 负样本
-                                    ]
-                                )
-                            mean_val = torch.mean(all_samples).item()
-                            std_val = max(torch.std(all_samples).item(), epsilon)  # 避免std为0
-                            uid_to_full_stats[uid] = {"mean": mean_val, "std": std_val}
-
-                        # 计算当前下采样样本的mean和std
-                        if len(id2score[uid]) > 1:
-                            downsampled_tensor = torch.stack(id2score[uid])
-                            downsampled_mean = torch.mean(downsampled_tensor).item()
-                            downsampled_std = torch.std(downsampled_tensor).item()
-                            uid_to_downsampled_stats[uid] = {"mean": downsampled_mean, "std": downsampled_std}
-                        else:
-                            uid_to_downsampled_stats[uid] = {"mean": 0.0, "std": 1.0}
-
-                        # 验证全正或全负的一致性
-                        is_full_positive = pos_count > 0 and neg_count == 0
-                        is_full_negative = pos_count == 0 and neg_count > 0
-                        is_downsampled_all_positive = all(s.item() > 0.5 for s in id2score[uid])  # 假设positive=1.0
-                        is_downsampled_all_negative = all(s.item() < 0.5 for s in id2score[uid])  # 假设negative=0.0
-
-                        if is_full_positive and not is_downsampled_all_positive:
-                            print(f"[ERROR] UID {uid}: 全量样本全正，但下采样样本不全正!")
-                        if is_full_negative and not is_downsampled_all_negative:
-                            print(f"[ERROR] UID {uid}: 全量样本全负，但下采样样本不全负!")
-                        if is_downsampled_all_positive and not is_full_positive:
-                            print(f"[ERROR] UID {uid}: 下采样样本全正，但全量样本不全正!")
-                        if is_downsampled_all_negative and not is_full_negative:
-                            print(f"[ERROR] UID {uid}: 下采样样本全负，但全量样本不全负!")
-
-                        # 当全正或全负时，验证mean和std的一致性
-                        if is_full_positive or is_full_negative:
-                            full_mean = uid_to_full_stats[uid]["mean"]
-                            full_std = uid_to_full_stats[uid]["std"]
-                            down_mean = uid_to_downsampled_stats[uid]["mean"]
-                            down_std = uid_to_downsampled_stats[uid]["std"]
-
-                            if abs(full_mean - down_mean) > 1e-6:
-                                print(
-                                    f"[ERROR] UID {uid}: 全正/全负时mean不一致! full={full_mean:.6f}, down={down_mean:.6f}"
-                                )
-                            if abs(full_std - down_std) > 1e-6:
-                                print(
-                                    f"[ERROR] UID {uid}: 全正/全负时std不一致! full={full_std:.6f}, down={down_std:.6f}"
-                                )
-
-                        # 收集调试例子 - 总是添加，最后取最后10个
-                        debug_examples.append(
-                            {
-                                "uid": uid,
-                                "pos_count": pos_count,
-                                "neg_count": neg_count,
-                                "total_count": total_count,
-                                "full_mean": uid_to_full_stats[uid]["mean"],
-                                "full_std": uid_to_full_stats[uid]["std"],
-                                "down_mean": uid_to_downsampled_stats[uid]["mean"],
-                                "down_std": uid_to_downsampled_stats[uid]["std"],
-                                "downsampled_scores": [s.item() for s in id2score[uid]],
-                            }
-                        )
-
-                # 打印调试例子 - 取最后10个
-                examples_to_show = debug_examples[-10:] if len(debug_examples) > 10 else debug_examples
-                print(f"\n调试例子 (最后{len(examples_to_show)}个UID):")
-                print("-" * 120)
-                print(
-                    f"{'UID':<8} {'Pos':<4} {'Neg':<4} {'Total':<6} {'Full_Mean':<10} {'Full_Std':<10} {'Down_Mean':<10} {'Down_Std':<10} {'Downsampled_Scores'}"
-                )
-                print("-" * 120)
-                for ex in examples_to_show:
-                    scores_str = str(ex["downsampled_scores"][:6])  # 只显示前6个
-                    if len(ex["downsampled_scores"]) > 6:
-                        scores_str = scores_str[:-1] + "...]"
-                    print(
-                        f"{str(ex['uid']):<8} {ex['pos_count']:<4} {ex['neg_count']:<4} {ex['total_count']:<6} "
-                        f"{ex['full_mean']:<10.4f} {ex['full_std']:<10.4f} {ex['down_mean']:<10.4f} {ex['down_std']:<10.4f} {scores_str}"
-                    )
-                print("-" * 120)
-
-                # 将计算出的stats映射到id2mean和id2std
-                for uid, stats in uid_to_full_stats.items():
-                    id2mean[uid] = torch.tensor(stats["mean"])
-                    id2std[uid] = torch.tensor(stats["std"])
-
-            else:
-                # 回退到原始逻辑：使用下采样后的样本计算mean和std
-                for i in range(bsz):
-                    id2score[index[i]].append(scores[i])
-                for idx in id2score:
-                    if len(id2score[idx]) == 1:
-                        id2mean[idx] = torch.tensor(0.0)
-                        id2std[idx] = torch.tensor(1.0)
-                    elif len(id2score[idx]) > 1:
-                        scores_tensor = torch.stack(id2score[idx])
-                        id2mean[idx] = torch.mean(scores_tensor)
-                        id2std[idx] = torch.std(scores_tensor)
-                    else:
-                        raise ValueError(f"no score in prompt index: {idx}")
-
-            # 应用advantage计算
-            for i in range(bsz):
-                if norm_adv_by_std_in_grpo:
-                    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-                else:
-                    scores[i] = scores[i] - id2mean[index[i]]
-            scores = scores.unsqueeze(-1) * response_mask
-
-        return scores, scores
-    else:
-        print("Using local statistics for GRPO advantage calculation.")
-        scores = token_level_rewards.sum(dim=-1)
-
-        id2score = defaultdict(list)
-        id2mean = {}
-        id2std = {}
-
-        with torch.no_grad():
-            bsz = scores.shape[0]
-            for i in range(bsz):
-                id2score[index[i]].append(scores[i])
-            for idx in id2score:
-                if len(id2score[idx]) == 1:
-                    id2mean[idx] = torch.tensor(0.0)
-                    id2std[idx] = torch.tensor(1.0)
-                elif len(id2score[idx]) > 1:
-                    scores_tensor = torch.stack(id2score[idx])
-                    id2mean[idx] = torch.mean(scores_tensor)
-                    id2std[idx] = torch.std(scores_tensor)
-                else:
-                    raise ValueError(f"no score in prompt index: {idx}")
-            for i in range(bsz):
-                if norm_adv_by_std_in_grpo:
-                    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-                else:
-                    scores[i] = scores[i] - id2mean[index[i]]
-            scores = scores.unsqueeze(-1) * response_mask
-
-        return scores, scores
 
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):

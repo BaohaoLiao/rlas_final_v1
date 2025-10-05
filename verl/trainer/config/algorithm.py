@@ -86,7 +86,8 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
 
-    # Function when adv_estimator == "reinforce_ada"
+    # Reinforce_Ada specific
+    multiround_downsampling: bool = False
     positive_threshold: float = 0.7
     max_rounds: int = 4
     round_repeat: int = 8

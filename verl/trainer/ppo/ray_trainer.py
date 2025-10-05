@@ -1247,7 +1247,7 @@ class RayPPOTrainer:
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REINFORCE_ADA:
+                    if self.config.algorithm.multiround_downsampling:
                         with marked_timer("gen_multi_round", timing_raw, color="red"):
                             final_batch, rounds_info = self._generate_multi_round_with_early_downsampling(
                                 orig_prompt_batch=gen_batch,
@@ -1420,7 +1420,7 @@ class RayPPOTrainer:
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # reward processing and downsampling already done in multi-round generation
-                        if self.config.algorithm.adv_estimator != AdvantageEstimator.REINFORCE_ADA:
+                        if not self.config.algorithm.multiround_downsampling:
                             # we combine with rule-based rm
                             reward_extra_infos_dict: dict[str, list]
                             if self.config.reward_model.launch_reward_fn_async:
