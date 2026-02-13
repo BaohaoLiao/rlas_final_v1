@@ -84,16 +84,13 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
-  filter_max_round: 4
-  filter_min_positive_samples: 4
-  filter_positive_threshold: 0.9
-  filter_max_total_samples_per_prompt: 8
-  filter_max_positive_samples_per_prompt: 4
-
-  # Whether to use global statistics for advantage estimation (specific to GRPO)
+  # Reinforce_Ada specific
+  multiround_adaptive_downsampling: False
+  reinforce_ada_choice: "balance"
+  positive_threshold: 0.7
+  max_rounds: 4
+  round_repeat: 8
   global_stat_est: False
-
-  clip_stats: False
 
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
@@ -222,18 +219,6 @@ trainer:
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
-
-  # whether to use uniform worker implementation
-  uniform_trainer: False
-
-  # whether to use adaptive trainer implementation
-  adaptive_trainer: False
-
-  adaptive_reuse_trainer: False
-
-  gen8_balanced_trainer: False
-
-  positive_trainer: False
 
 
 # profiler configs
